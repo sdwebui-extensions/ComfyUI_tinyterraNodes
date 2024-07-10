@@ -5,13 +5,14 @@ import folder_paths
 import subprocess
 import shutil
 import os
+from comfy.cli_args import args
 
 # ------- CONFIG -------- #
 cwd_path = os.path.dirname(os.path.realpath(__file__))
 js_path = os.path.join(cwd_path, "js")
 comfy_path = folder_paths.base_path
 
-config_path = os.path.join(cwd_path, "config.ini")
+config_path = os.path.join(args.data_dir, "config.ini")
 
 optionValues = {
         "auto_update": ('true', 'false'),
