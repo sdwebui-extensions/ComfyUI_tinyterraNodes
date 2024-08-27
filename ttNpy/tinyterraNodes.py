@@ -37,11 +37,13 @@ import comfy.utils
 import folder_paths
 import comfy.samplers
 import latent_preview
-import comfy.model_base
 import comfy.controlnet
 import comfy.model_management
-import comfy_extras.nodes_model_advanced
+import comfy.supported_models
+import comfy.supported_models_base
+from comfy.model_base import BaseModel
 import comfy_extras.nodes_upscale_model
+import comfy_extras.nodes_model_advanced
 from comfy.sd import CLIP, VAE
 from spandrel import ModelLoader, ImageModelDescriptor
 from .adv_encode import advanced_encode
@@ -156,6 +158,8 @@ class ttNloader:
 
         clip = loaded_ckpt[1].clone() if loaded_ckpt[1] is not None else None
         if clip_skip != 0 and clip is not None:
+            if sampler.get_model_type(loaded_ckpt[0]) in ['FLUX', 'FLOW']:
+                raise Exception('FLOW and FLUX do not support clip_skip. Set clip_skip to 0.')
             clip.clip_layer(clip_skip)
 
         # model, clip, vae
@@ -187,8 +191,6 @@ class ttNloader:
     def load_lora(self, lora_name, model, clip, strength_model, strength_clip):
         if strength_model == 0 and strength_clip == 0:
             return (model, clip)
-
-        #print('LORA NAME', lora_name)
 
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if lora_path is None or not os.path.exists(lora_path):
@@ -325,6 +327,8 @@ class ttNloader:
             clip = clip_override.clone()
 
             if clip_skip != 0:
+                if sampler.get_model_type(model) in ['FLUX', 'FLOW']:
+                    raise Exception('FLOW and FLUX do not support clip_skip. Set clip_skip to 0.')
                 clip.clip_layer(clip_skip)
             del clip_override
 
@@ -382,11 +386,20 @@ class ttNsampler:
             parts.append('None')
         return parts
 
-    def emptyLatent(self, empty_latent_aspect: str, batch_size:int, width:int = None, height:int = None) -> torch.Tensor:
+    @staticmethod
+    def get_model_type(model):
+        base: BaseModel = model.model
+        return str(base.model_type).split('.')[1].strip()
+
+    def emptyLatent(self, empty_latent_aspect: str, batch_size:int, width:int = None, height:int = None, sd3: bool = False) -> torch.Tensor:
         if empty_latent_aspect and empty_latent_aspect != "width x height [custom]":
             width, height = empty_latent_aspect.replace(' ', '').split('[')[0].split('x')
 
-        latent = torch.zeros([batch_size, 4, int(height) // 8, int(width) // 8], device=self.device)
+        if sd3:
+            latent = torch.ones([batch_size, 16, int(height) // 8, int(width) // 8], device=self.device) * 0.0609
+        else:
+            latent = torch.zeros([batch_size, 4, int(height) // 8, int(width) // 8], device=self.device)
+
         return latent
 
     def common_ksampler(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False, preview_latent=True, disable_pbar=False):
@@ -1071,23 +1084,18 @@ class ttNsave:
 
         return results
 
-    def textfile(self, text, filename_prefix, output_type, group_id=0, ext='txt'):
-        if output_type == "Hide":
-            return []
-        if output_type in ("Save", "Hide/Save"):
-            output_dir = self.output_dir if self.output_dir != folder_paths.get_temp_directory() else folder_paths.get_output_directory()
-        if output_type == "Preview":
-            filename_prefix = 'ttNpreview'
+    def textfile(self, text, filename_prefix, ext='txt'):
+        output_dir = self.output_dir if self.output_dir != folder_paths.get_temp_directory() else folder_paths.get_output_directory()
 
-        filename = ttNsave.filename_parser(output_dir, filename_prefix, self.prompt, self.my_unique_id, self.number_padding, group_id, ext)
+        filename, subfolder = ttNsave.filename_parser(output_dir, filename_prefix, self.prompt, self.my_unique_id, self.number_padding, 0, ext)
 
-        file_path = os.path.join(output_dir, filename)
+        file_path = os.path.join(output_dir, subfolder, filename)
 
         if self.overwrite_existing or not os.path.isfile(file_path):
             with open(file_path, 'w') as f:
                 f.write(text)
         else:
-            ttNl(f"File {file_path} already exists... Skipping").error().p()   
+            ttNl(f"File {file_path} already exists... Skipping").error().p()
 
 loader = ttNloader()
 sampler = ttNsampler()
@@ -1142,8 +1150,8 @@ class ttN_pipeLoader_v2:
                     "clip_override": ("CLIP",), 
                     "optional_lora_stack": ("LORA_STACK",),
                     "optional_controlnet_stack": ("CONTROL_NET_STACK",),
-                    "prepend_positive": ("STRING", {"default": None, "forceInput": True}),
-                    "prepend_negative": ("STRING", {"default": None, "forceInput": True}),
+                    "prepend_positive": ("STRING", {"forceInput": True}),
+                    "prepend_negative": ("STRING", {"forceInput": True}),
                     },
                 "hidden": {"prompt": "PROMPT", "ttNnodeVersion": ttN_pipeLoader_v2.version, "my_unique_id": "UNIQUE_ID",}
                 }
@@ -1166,13 +1174,14 @@ class ttN_pipeLoader_v2:
         clip: CLIP | None = None
         vae: VAE | None = None
 
-        # Create Empty Latent
-        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height)
-        samples = {"samples":latent}
-
         loader.clear_cache(prompt)
         model, clip, vae = loader.load_main3(ckpt_name, config_name, vae_name, loras, clip_skip, model_override, clip_override, optional_lora_stack, my_unique_id)
 
+        # Create Empty Latent
+        sd3 = True if sampler.get_model_type(model) in ['FLUX', 'FLOW'] else False
+        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height, sd3)
+        samples = {"samples":latent}
+        
         positive_embedding = loader.embedding_encode(positive, positive_token_normalization, positive_weight_interpretation, clip, seed=seed, title='pipeLoader Positive', my_unique_id=my_unique_id, prepend_text=prepend_positive)
         negative_embedding = loader.embedding_encode(negative, negative_token_normalization, negative_weight_interpretation, clip, seed=seed, title='pipeLoader Negative', my_unique_id=my_unique_id, prepend_text=prepend_negative)
 
@@ -1532,10 +1541,10 @@ class ttN_pipeLoaderSDXL_v2:
                     "optional_controlnet_stack": ("CONTROL_NET_STACK",),
                     "refiner_model_override": ("MODEL",),
                     "refiner_clip_override": ("CLIP",),
-                    "prepend_positive_g": ("STRING", {"default": None, "forceInput": True}),
-                    "prepend_positive_l": ("STRING", {"default": None, "forceInput": True}),
-                    "prepend_negative_g": ("STRING", {"default": None, "forceInput": True}),
-                    "prepend_negative_l": ("STRING", {"default": None, "forceInput": True}),
+                    "prepend_positive_g": ("STRING", {"forceInput": True}),
+                    "prepend_positive_l": ("STRING", {"forceInput": True}),
+                    "prepend_negative_g": ("STRING", {"forceInput": True}),
+                    "prepend_negative_l": ("STRING", {"forceInput": True}),
                     },
                 "hidden": {"prompt": "PROMPT", "ttNnodeVersion": ttN_pipeLoaderSDXL_v2.version, "my_unique_id": "UNIQUE_ID",}
                 }
@@ -1562,18 +1571,18 @@ class ttN_pipeLoaderSDXL_v2:
         clip: CLIP | None = None
         vae: VAE | None = None
 
-        # Create Empty Latent
-        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height)
-        samples = {"samples":latent}
-
         loader.clear_cache(prompt)
         model, clip, vae = loader.load_main3(ckpt_name, config_name, vae_name, loras, clip_skip, model_override, clip_override, optional_lora_stack, my_unique_id)
 
+        # Create Empty Latent
+        sd3 = True if sampler.get_model_type(model) in ['FLUX', 'FLOW'] else False
+        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height, sd3)
+        samples = {"samples":latent}
+    
         if refiner_ckpt_name not in ["None", None]:
             refiner_model, refiner_clip, refiner_vae = loader.load_main3(refiner_ckpt_name, refiner_config_name, vae_name, None, clip_skip, refiner_model_override, refiner_clip_override)
         else:
             refiner_model, refiner_clip, refiner_vae = None, None, None
-
 
         if empty_latent_aspect and empty_latent_aspect != "width x height [custom]":
             empty_latent_width, empty_latent_height = empty_latent_aspect.replace(' ', '').split('[')[0].split('x')
@@ -2251,11 +2260,13 @@ class ttN_tinyLoader:
         clip: CLIP | None = None
         vae: VAE | None = None
 
+        model, clip, vae = loader.load_checkpoint(ckpt_name, config_name, clip_skip)
+
         # Create Empty Latent
-        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height)
+        sd3 = True if sampler.get_model_type(model) in ['FLUX', 'FLOW'] else False
+        latent = sampler.emptyLatent(empty_latent_aspect, batch_size, empty_latent_width, empty_latent_height, sd3)
         samples = {"samples": latent}
 
-        model, clip, vae = loader.load_checkpoint(ckpt_name, config_name, clip_skip)
         if vae_name != "Baked VAE":
             vae = loader.load_vae(vae_name)
 
@@ -2274,23 +2285,23 @@ class ttN_conditioning:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": { 
-                        "model": ("MODEL",),
-                        "clip": ("CLIP",),
+                    "model": ("MODEL",),
+                    "clip": ("CLIP",),
 
-                        "loras": ("STRING", {"placeholder": "<lora:loraName:weight:optClipWeight>", "multiline": True}),
+                    "loras": ("STRING", {"placeholder": "<lora:loraName:weight:optClipWeight>", "multiline": True}),
 
-                        "positive": ("STRING", {"default": "Positive","multiline": True, "dynamicPrompts": True}),
-                        "positive_token_normalization": (["none", "mean", "length", "length+mean"],),
-                        "positive_weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
+                    "positive": ("STRING", {"default": "Positive","multiline": True, "dynamicPrompts": True}),
+                    "positive_token_normalization": (["none", "mean", "length", "length+mean"],),
+                    "positive_weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
 
-                        "negative": ("STRING", {"default": "Negative", "multiline": True, "dynamicPrompts": True}),
-                        "negative_token_normalization": (["none", "mean", "length", "length+mean"],),
-                        "negative_weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
-                        },                
+                    "negative": ("STRING", {"default": "Negative", "multiline": True, "dynamicPrompts": True}),
+                    "negative_token_normalization": (["none", "mean", "length", "length+mean"],),
+                    "negative_weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
+                    },
                 "optional": {
                     "optional_lora_stack": ("LORA_STACK",),
-                    "prepend_positive": ("STRING", {"default": None, "forceInput": True}),
-                    "prepend_negative": ("STRING", {"default": None, "forceInput": True}),
+                    "prepend_positive": ("STRING", {"forceInput": True}),
+                    "prepend_negative": ("STRING", {"forceInput": True}),
                     },
                 "hidden": {"ttNnodeVersion": ttN_conditioning.version, "my_unique_id": "UNIQUE_ID"},}
 
@@ -3213,6 +3224,41 @@ class ttN_textCycleLine:
         if index >= len(lines):
             index = len(lines) - 1
         return (lines[index],)
+
+class ttN_textOUPUT:
+    version = '1.0.1'
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "text_output": (["Preview", "Save"],{"default": "Preview"}),
+                "text": ("STRING", {"multiline": True}),
+                "output_path": ("STRING", {"default": folder_paths.get_output_directory(), "multiline": False}),
+                "save_prefix": ("STRING", {"default": "ComfyUI"}),
+                "number_padding": (["None", 2, 3, 4, 5, 6, 7, 8, 9],{"default": 5}),
+                "file_type": (["txt", "md", "rtf", "log", "ini", "csv"], {"default": "txt"}),
+                "overwrite_existing": ("BOOLEAN", {"default": False}),
+                },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "my_unique_id": "UNIQUE_ID",
+                            "ttNnodeVersion": ttN_imageOUPUT.version},
+            }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "output"
+    CATEGORY = "🌏 tinyterra/text"
+    OUTPUT_NODE = True
+
+    def output(self, text_output, text, output_path, save_prefix, number_padding, file_type, overwrite_existing, prompt, extra_pnginfo, my_unique_id):
+        if text_output == 'Save':
+            ttN_save = ttNsave(my_unique_id, prompt, extra_pnginfo, number_padding, overwrite_existing, output_path)
+            ttN_save.textfile(text, save_prefix, file_type)
+
+        # Output text results to ui and node outputs
+        return {"ui": {"text": text},
+                "result": (text,)}
 #---------------------------------------------------------------ttN/text END------------------------------------------------------------------------#
 
 
@@ -3521,7 +3567,7 @@ TTN_VERSIONS = {
     "pipe2BASIC": ttN_pipe_2BASIC.version,
     "pipe2DETAILER": ttN_pipe_2DETAILER.version,
     "advanced xyPlot": ttN_advanced_XYPlot.version,
-#    "advPlot merge": ttN_advPlot_merge.version,
+#   "advPlot merge": ttN_advPlot_merge.version,
     "advPlot range": ttN_advPlot_range.version,
     "advPlot string": ttN_advPlot_string.version,
     "advPlot combo": ttN_advPlot_combo.version,
@@ -3535,6 +3581,7 @@ TTN_VERSIONS = {
     "text3BOX_3WAYconcat": ttN_text3BOX_3WAYconcat.version,    
     "text7BOX_concat": ttN_text7BOX_concat.version,
     "textCycleLine": ttN_textCycleLine.version,
+    "textOutput": ttN_textOUPUT.version,
     "imageOutput": ttN_imageOUPUT.version,
     "imageREMBG": ttN_imageREMBG.version,
     "hiresfixScale": ttN_modelScale.version,
@@ -3555,7 +3602,7 @@ NODE_CLASS_MAPPINGS = {
     "ttN pipeLoaderSDXL_v2": ttN_pipeLoaderSDXL_v2,
     "ttN pipeKSamplerSDXL_v2": ttN_pipeKSamplerSDXL_v2,
     "ttN advanced xyPlot": ttN_advanced_XYPlot,
-#    "ttN advPlot merge": ttN_advPlot_merge,
+#   "ttN advPlot merge": ttN_advPlot_merge,
     "ttN advPlot range": ttN_advPlot_range,
     "ttN advPlot string": ttN_advPlot_string,
     "ttN advPlot combo": ttN_advPlot_combo,
@@ -3576,6 +3623,7 @@ NODE_CLASS_MAPPINGS = {
     "ttN text3BOX_3WAYconcat": ttN_text3BOX_3WAYconcat,    
     "ttN text7BOX_concat": ttN_text7BOX_concat,
     "ttN textCycleLine": ttN_textCycleLine,
+    "ttN textOutput": ttN_textOUPUT,
 
     #ttN/image
     "ttN imageOutput": ttN_imageOUPUT,
@@ -3592,6 +3640,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ttN tinyLoader": "tinyLoader",
     "ttN conditioning": "tinyConditioning",
     "ttN KSampler_v2": "tinyKSampler",
+    
     #ttN/pipe    
     "ttN pipeLoader_v2": "pipeLoader",
     "ttN pipeKSampler_v2": "pipeKSampler",
@@ -3606,7 +3655,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     #ttN/xyPlot
     "ttN advanced xyPlot": "advanced xyPlot",
-#    "ttN advPlot merge": "advPlot merge",
+#   "ttN advPlot merge": "advPlot merge",
     "ttN advPlot range": "advPlot range",
     "ttN advPlot string": "advPlot string",
     "ttN advPlot combo": "advPlot combo",   
@@ -3622,6 +3671,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ttN text7BOX_concat": "7x TXT Loader Concat",
     "ttN text3BOX_3WAYconcat": "3x TXT Loader MultiConcat",
     "ttN textCycleLine": "textCycleLine",
+    "ttN textOutput": "textOutput",
 
     #ttN/image
     "ttN imageREMBG": "imageRemBG",
