@@ -11,7 +11,7 @@
 # Like the pack and want to support me?                     https://www.buymeacoffee.com/tinyterra                                                  #
 #---------------------------------------------------------------------------------------------------------------------------------------------------#
 
-ttN_version = '2.0.3'
+ttN_version = '2.0.7'
 
 import os
 import re
@@ -48,7 +48,7 @@ from comfy.sd import CLIP, VAE
 from spandrel import ModelLoader, ImageModelDescriptor
 from .adv_encode import advanced_encode
 from comfy.model_patcher import ModelPatcher
-from nodes import MAX_RESOLUTION, ControlNetApplyAdvanced
+from nodes import MAX_RESOLUTION, ControlNetApplyAdvanced, ConditioningZeroOut
 from nodes import NODE_CLASS_MAPPINGS as COMFY_CLASS_MAPPINGS
 
 from .utils import CC, ttNl, ttNpaths, AnyType
@@ -241,7 +241,7 @@ class ttNloader:
         
         return model, clip
         
-    def embedding_encode(self, text, token_normalization, weight_interpretation, clip, seed=None, title=None, my_unique_id=None, prepend_text=None):
+    def embedding_encode(self, text, token_normalization, weight_interpretation, clip, seed=None, title=None, my_unique_id=None, prepend_text=None, zero_out=False):
         text = f'{prepend_text} {text}' if prepend_text is not None else text
         if seed is None:
             seed = self.string_to_seed(text)
@@ -249,7 +249,12 @@ class ttNloader:
         text = self.nsp_parse(text, seed, title=title, my_unique_id=my_unique_id)
 
         embedding, pooled = advanced_encode(clip, text, token_normalization, weight_interpretation, w_max=1.0, apply_to_pooled='enable')
-        return [[embedding, {"pooled_output": pooled}]]
+        conditioning = [[embedding, {"pooled_output": pooled}]]
+
+        if zero_out is True and text.strip() == '':
+            return ConditioningZeroOut().zero_out(conditioning)[0]
+        else:
+            return conditioning
 
     def embedding_encodeXL(self, text, clip, seed=0, title=None, my_unique_id=None, prepend_text=None, text2=None, prepend_text2=None, width=None, height=None, crop_width=0, crop_height=0, target_width=None, target_height=None, refiner_clip=None, ascore=None):
         text = f'{prepend_text} {text}' if prepend_text is not None else text
@@ -529,6 +534,7 @@ class ttNadv_xyPlot:
         self.z_points = adv_xyPlot.get("z_plot", None)
         self.save_individuals = adv_xyPlot.get("save_individuals", False)
         self.image_output = prompt[str(unique_id)]["inputs"]["image_output"]
+        self.invert_bg = adv_xyPlot.get("invert_bg", False)
         self.x_labels = []
         self.y_labels = []
         self.z_labels = []
@@ -604,7 +610,12 @@ class ttNadv_xyPlot:
         font_size = min(max_font_size, font_size)
         font_size = max(min_font_size, font_size)
 
-        label_bg = Image.new('RGBA', (label_width, 0), color=(255, 255, 255, 0))  # Temporary height
+        if self.invert_bg:
+            fill_color = 'white'
+        else:
+            fill_color = 'black'
+
+        label_bg = Image.new('RGBA', (label_width, 0), color=(0, 0, 0, 0))  # Temporary height
         d = ImageDraw.Draw(label_bg)
 
         font = self.get_font(font_size)
@@ -636,7 +647,7 @@ class ttNadv_xyPlot:
         line_height = int(font_size * 1.2)  # Increased line height for spacing
         label_height = len(lines) * line_height
 
-        label_bg = Image.new('RGBA', (label_width, label_height), color=(255, 255, 255, 0))
+        label_bg = Image.new('RGBA', (label_width, label_height), color=(0, 0, 0, 0))
         d = ImageDraw.Draw(label_bg)
 
         current_y = 0
@@ -648,7 +659,7 @@ class ttNadv_xyPlot:
             text_x = (label_width - text_width) // 2
             text_y = current_y
             current_y += line_height
-            d.text((text_x, text_y), line, fill='black', font=font)
+            d.text((text_x, text_y), line, fill=fill_color, font=font)
 
         return label_bg
 
@@ -681,7 +692,12 @@ class ttNadv_xyPlot:
     def plot_images(self, z_label):
         bg_width, bg_height, x_offset_initial, y_offset = self.calculate_background_dimensions()
 
-        background = Image.new('RGBA', (int(bg_width), int(bg_height)), color=(255, 255, 255, 255))
+        if self.invert_bg:
+             bg_color = (0, 0, 0, 255) 
+        else:
+            bg_color = (255, 255, 255, 255)
+
+        background = Image.new('RGBA', (int(bg_width), int(bg_height)), color=bg_color)
 
         for row_index in range(self.num_rows):
             x_offset = x_offset_initial
@@ -737,7 +753,7 @@ class ttNadv_xyPlot:
 
             self.executor.execute(prompt, self.num, extra_data, valid[2])
 
-            if len(self.executor.outputs[self.unique_id]) > 2:
+            if len(self.executor.outputs.get(self.unique_id, [])) > 2:
                 self.latent_list.append(self.executor.outputs[self.unique_id][-6][0]["samples"])
 
                 image = self.executor.outputs[self.unique_id][-3][0]
@@ -785,6 +801,10 @@ class ttNadv_xyPlot:
                         elif value.lower() == 'false':
                             value = False
                         value = bool(value)
+                    elif type(ivalues[0]) == list:
+                        if value not in ivalues[0]:
+                            raise KeyError(f'"{value}" not a valid value for input "{iname}" in xyplot')
+                        
         return input_name, value
   
     def xy_plot_process(self):
@@ -822,29 +842,36 @@ class ttNadv_xyPlot:
 
             return prompt
 
+        def execute_y_plot(prompt, x_label, z_label):
+            for _, nodes in self.y_points.items():
+                y_label = nodes["label"]
+                self.y_labels.append(y_label)
+                y_prompt = copy.deepcopy(prompt)
+                y_prompt = update_prompt(y_prompt, nodes)
+                        
+                self.num += 1
+                self.execute_prompt(y_prompt, self.extra_pnginfo, x_label, y_label, z_label)
+
         for _, nodes in self.z_points.items():
             z_label = nodes["label"]
             z_prompt = copy.deepcopy(base_prompt)
             z_prompt = update_prompt(z_prompt, nodes)
 
-            for _, nodes in self.x_points.items():
-                x_label = nodes["label"]
-                self.x_labels.append(x_label)
-                x_prompt = copy.deepcopy(z_prompt)
-                x_prompt = update_prompt(x_prompt, nodes)
-                        
-                if self.y_points:
-                    for _, nodes in self.y_points.items():
-                        y_label = nodes["label"]
-                        self.y_labels.append(y_label)
-                        y_prompt = copy.deepcopy(x_prompt)
-                        y_prompt = update_prompt(y_prompt, nodes)
-                                
+            if self.x_points:
+                for _, nodes in self.x_points.items():
+                    x_label = nodes["label"]
+                    self.x_labels.append(x_label)
+                    x_prompt = copy.deepcopy(z_prompt)
+                    x_prompt = update_prompt(x_prompt, nodes)
+                            
+                    if self.y_points:
+                        execute_y_plot(x_prompt, x_label, z_label)
+                    else:
                         self.num += 1
-                        self.execute_prompt(y_prompt, self.extra_pnginfo, x_label, y_label, z_label)
-                else:
-                    self.num += 1
-                    self.execute_prompt(x_prompt, self.extra_pnginfo, x_label, y_label, z_label)
+                        self.execute_prompt(x_prompt, self.extra_pnginfo, x_label, y_label, z_label)
+            
+            elif self.y_points:
+                execute_y_plot(z_prompt, None, z_label)
 
             # Rearrange latent array to match preview image grid
             if len(self.latent_list) > 0:
@@ -1452,9 +1479,8 @@ class ttN_pipeKSamplerAdvanced_v2:
                 "ttNnodeVersion": ttN_pipeKSamplerAdvanced_v2.version
                 },
             }
-
-    RETURN_TYPES = ("PIPE_LINE", "MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "VAE", "CLIP", "IMAGE", "INT", )
-    RETURN_NAMES = ("pipe", "model", "positive", "negative", "latent","vae", "clip", "image", "seed", )
+    RETURN_TYPES = ("PIPE_LINE", "MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "VAE", "CLIP", "IMAGE", "INT", "IMAGE")
+    RETURN_NAMES = ("pipe", "model", "positive", "negative", "latent","vae", "clip", "images", "seed", "plot_image")
     OUTPUT_NODE = True
     FUNCTION = "adv_sample"
     CATEGORY = "🌏 tinyterra/pipe"
@@ -2290,7 +2316,7 @@ class ttN_tinyLoader:
         return (model, samples, vae, clip, empty_latent_width, empty_latent_height)
 
 class ttN_conditioning:
-    version = '1.0.0'
+    version = '1.0.2'
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": { 
@@ -2306,6 +2332,7 @@ class ttN_conditioning:
                     "negative": ("STRING", {"default": "Negative", "multiline": True, "dynamicPrompts": True}),
                     "negative_token_normalization": (["none", "mean", "length", "length+mean"],),
                     "negative_weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
+                    "zero_out_empty": ("BOOLEAN", {"default": False}),
                     },
                 "optional": {
                     "optional_lora_stack": ("LORA_STACK",),
@@ -2322,7 +2349,7 @@ class ttN_conditioning:
 
     def condition(self, model, clip, loras,
                        positive, positive_token_normalization, positive_weight_interpretation, 
-                       negative, negative_token_normalization, negative_weight_interpretation, 
+                       negative, negative_token_normalization, negative_weight_interpretation, zero_out_empty,
                        optional_lora_stack=None, prepend_positive=None, prepend_negative=None,
                        my_unique_id=None):
 
@@ -2333,11 +2360,13 @@ class ttN_conditioning:
         if loras not in [None, "None"]:
             model, clip = loader.load_lora_text(loras, model, clip)
 
-        positive_embedding = loader.embedding_encode(positive, positive_token_normalization, positive_weight_interpretation, clip, title='ttN Conditioning Positive', my_unique_id=my_unique_id, prepend_text=prepend_positive)
-        negative_embedding = loader.embedding_encode(negative, negative_token_normalization, negative_weight_interpretation, clip, title='ttN Conditioning Negative', my_unique_id=my_unique_id, prepend_text=prepend_negative)
+        positive_embedding = loader.embedding_encode(positive, positive_token_normalization, positive_weight_interpretation, clip, title='ttN Conditioning Positive',
+                                                     my_unique_id=my_unique_id, prepend_text=prepend_positive, zero_out=zero_out_empty)
+        negative_embedding = loader.embedding_encode(negative, negative_token_normalization, negative_weight_interpretation, clip, title='ttN Conditioning Negative',
+                                                     my_unique_id=my_unique_id, prepend_text=prepend_negative, zero_out=zero_out_empty)
 
-        final_positive = (prepend_positive + ' ' if prepend_positive else '') + (positive + ' ' if positive else '')
-        final_negative = (prepend_negative + ' ' if prepend_negative else '') + (negative + ' ' if negative else '')
+        final_positive = (prepend_positive + ' ' if prepend_positive else '') + (positive if positive else '')
+        final_negative = (prepend_negative + ' ' if prepend_negative else '') + (negative if negative else '')
 
         return (model, positive_embedding, negative_embedding, clip, final_positive, final_negative)
 
@@ -2481,7 +2510,7 @@ class ttN_KSampler_v2:
 
 #-------------------------------------------------------------ttN/xyPlot START----------------------------------------------------------------------#
 class ttN_advanced_XYPlot:
-    version = '1.2.0'
+    version = '1.2.1'
     plotPlaceholder = "_PLOT\nExample:\n\n<axis number:label1>\n[node_ID:widget_Name='value']\n\n<axis number2:label2>\n[node_ID:widget_Name='value2']\n[node_ID:widget2_Name='value']\n[node_ID2:widget_Name='value']\n\netc..."
 
     def get_plot_points(plot_data, unique_id, plot_Line):
@@ -2550,6 +2579,7 @@ class ttN_advanced_XYPlot:
                 "x_plot": ("STRING",{"default": '', "multiline": True, "placeholder": 'X' + ttN_advanced_XYPlot.plotPlaceholder, "pysssss.autocomplete": False}),
                 "y_plot": ("STRING",{"default": '', "multiline": True, "placeholder": 'Y' + ttN_advanced_XYPlot.plotPlaceholder, "pysssss.autocomplete": False}),
                 "z_plot": ("STRING",{"default": '', "multiline": True, "placeholder": 'Z' + ttN_advanced_XYPlot.plotPlaceholder, "pysssss.autocomplete": False}),
+                "invert_background": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
                 "my_unique_id": "UNIQUE_ID",
@@ -2563,7 +2593,7 @@ class ttN_advanced_XYPlot:
 
     CATEGORY = "🌏 tinyterra/xyPlot"
     
-    def plot(self, grid_spacing, save_individuals, flip_xy, x_plot=None, y_plot=None, z_plot=None, my_unique_id=None):
+    def plot(self, grid_spacing, save_individuals, flip_xy, x_plot=None, y_plot=None, z_plot=None, my_unique_id=None, invert_background=False):
         x_plot = ttN_advanced_XYPlot.get_plot_points(x_plot, my_unique_id, 'X')
         y_plot = ttN_advanced_XYPlot.get_plot_points(y_plot, my_unique_id, 'Y')
         z_plot = ttN_advanced_XYPlot.get_plot_points(z_plot, my_unique_id, 'Z')
@@ -2580,7 +2610,8 @@ class ttN_advanced_XYPlot:
                    "y_plot": y_plot,
                    "z_plot": z_plot,
                    "grid_spacing": grid_spacing,
-                   "save_individuals": save_individuals,}
+                   "save_individuals": save_individuals,
+                   "invert_bg": invert_background}
         
         return (xy_plot, )
 
@@ -2643,61 +2674,6 @@ class ttN_advPlot_images:
             return (images, plot_image)
 
         return {"ui": {"images": plot_result}, "result": (images, plot_image)}
-
-
-'''
-class ttN_advPlot_merge:
-    version = '1.0.0'
-    def __init__(self):
-        pass
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "label_type": (['Values', 'Title and Values', 'ID, Title and Values'],{"default": "Values"}),
-            },
-            "optional": {
-                "values1": ("TTN_XY_VALUES",),
-                "values2": ("TTN_XY_VALUES",),
-                "values3": ("TTN_XY_VALUES",),
-                "values4": ("TTN_XY_VALUES",),
-                "values5": ("TTN_XY_VALUES",),
-                "values6": ("TTN_XY_VALUES",),
-                "values7": ("TTN_XY_VALUES",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("plot_text",)
-    FUNCTION = "plot"
-
-    CATEGORY = "🌏 tinyterra/xyPlot"
-
-    def plot(self, label_type, values1={}, values2={}, values3={}, values4={}, values5={}, values6={}, values7={}):
-        label_map = {
-            'Values': 'v_label',
-            'Title and Values': 'tv_label',
-            'ID, Title and Values': 'idtv_label',
-        }
-        label = label_map[label_type]
-
-        number_of_lines = max(len(values1), len(values2), len(values3), len(values4), len(values5), len(values6), len(values7))
-        if number_of_lines == 0:
-            return ''
-        lines = []
-        for num in range(1, number_of_lines + 1):
-            line = f'<{num}:{label}>'
-            lines.append(line)
-            for vals in [values1, values2, values3, values4, values5, values6, values7]:
-                if len(vals) >= num:
-                    val_line = vals.get(num, None)
-                    if val_line is not None:
-                        lines.append(val_line)
-
-        final = '\n'.join(lines)
-        return (final, )
-'''
 
 class ttN_advPlot_range:
     version = '1.1.0'
@@ -2906,6 +2882,59 @@ class ttN_advPlot_combo:
             
         out = '\n'.join(plot_text)
 
+        return {"ui": {"text": out}, "result": (out,)}
+
+class ttN_advPlot_merge:
+    version = '1.0.0'
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "label_type": (['Values', 'Title and Values', 'ID, Title and Values'],{"default": "Values"}),
+            },
+            "optional": {
+                "plot_text1": ("STRING", {"forceInput": True,}),
+                "plot_text2": ("STRING",{"forceInput": True,}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("plot_text",)
+    FUNCTION = "plot"
+
+    CATEGORY = "🌏 tinyterra/xyPlot"
+
+    def plot(self, label_type, plot_text1='', plot_text2='', ):
+        label_map = {
+            'Values': 'v_label',
+            'Title and Values': 'tv_label',
+            'ID, Title and Values': 'idtv_label',
+        }
+        label = label_map.get(label_type, 'v_label')
+
+        text1 = plot_text1.split("<") if plot_text1 else []
+        text2 = plot_text2.split("<") if plot_text2 else []
+
+        number_of_lines = max(len(text1) - 1, len(text2) - 1, 0)
+        if number_of_lines == 0:
+            return ''
+        
+        lines = []
+        for num in range(1, number_of_lines + 1):
+            lines.append(f'<{num}:{label}>\n')
+
+            for text in (text1, text2):
+                if num < len(text):
+                    parts = text[num].split('>\n', 1)
+                    if len(parts) == 2:
+                        lines.append(parts[1])
+                        if not parts[1].endswith('\n'):
+                            lines.append('\n')
+
+        out = ''.join(lines)
         return {"ui": {"text": out}, "result": (out,)}
 #--------------------------------------------------------------ttN/xyPlot END-----------------------------------------------------------------------#
 
@@ -3640,10 +3669,10 @@ TTN_VERSIONS = {
     "pipe2DETAILER": ttN_pipe_2DETAILER.version,
     "advanced xyPlot": ttN_advanced_XYPlot.version,
     'advPlot images': ttN_advPlot_images.version,
-#   "advPlot merge": ttN_advPlot_merge.version,
     "advPlot range": ttN_advPlot_range.version,
     "advPlot string": ttN_advPlot_string.version,
     "advPlot combo": ttN_advPlot_combo.version,
+    "advPlot merge": ttN_advPlot_merge.version,
     "pipeEncodeConcat": ttN_pipeEncodeConcat.version,
     "multiLoraStack": ttN_pipeLoraStack.version,
     "multiModelMerge": ttN_multiModelMerge.version,
@@ -3676,10 +3705,10 @@ NODE_CLASS_MAPPINGS = {
     "ttN pipeKSamplerSDXL_v2": ttN_pipeKSamplerSDXL_v2,
     "ttN advanced xyPlot": ttN_advanced_XYPlot,
     "ttN advPlot images": ttN_advPlot_images,
-#   "ttN advPlot merge": ttN_advPlot_merge,
     "ttN advPlot range": ttN_advPlot_range,
     "ttN advPlot string": ttN_advPlot_string,
     "ttN advPlot combo": ttN_advPlot_combo,
+    "ttN advPlot merge": ttN_advPlot_merge,
     "ttN pipeEDIT": ttN_pipe_EDIT,
     "ttN pipe2BASIC": ttN_pipe_2BASIC,
     "ttN pipe2DETAILER": ttN_pipe_2DETAILER,
@@ -3730,10 +3759,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     #ttN/xyPlot
     "ttN advanced xyPlot": "advanced xyPlot",
     "ttN advPlot images": "advPlot images",
-#   "ttN advPlot merge": "advPlot merge",
     "ttN advPlot range": "advPlot range",
     "ttN advPlot string": "advPlot string",
-    "ttN advPlot combo": "advPlot combo",   
+    "ttN advPlot combo": "advPlot combo",  
+    "ttN advPlot merge": "advPlot merge", 
     
     #ttN/misc
     "ttN multiModelMerge": "multiModelMerge",
