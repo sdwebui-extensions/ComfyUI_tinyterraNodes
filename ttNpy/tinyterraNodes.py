@@ -11,8 +11,9 @@
 # Like the pack and want to support me?                     https://www.buymeacoffee.com/tinyterra                                                  #
 #---------------------------------------------------------------------------------------------------------------------------------------------------#
 
-ttN_version = '2.0.7'
+ttN_version = '2.0.9'
 
+import asyncio
 import os
 import re
 import json
@@ -23,6 +24,7 @@ from pathlib import Path
 from urllib.request import urlopen
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Union, Any
+import uuid
 
 import numpy as np
 import torch
@@ -746,7 +748,33 @@ class ttNadv_xyPlot:
             return initial_font_size
     
     def execute_prompt(self, prompt, extra_data, x_label, y_label, z_label):
-        valid = execution.validate_prompt(prompt)
+        prompt_id = uuid.uuid4()
+
+        # Try to get the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # Already inside an event loop (e.g. some backends or async-enabled ComfyUI)
+            import threading
+
+            result_container = {}
+
+            def run_coroutine():
+                coro = execution.validate_prompt(prompt_id, prompt, None)
+                result_container["result"] = asyncio.run(coro)
+
+            thread = threading.Thread(target=run_coroutine)
+            thread.start()
+            thread.join()
+
+            valid = result_container["result"]
+        else:
+            # Safe to run directly
+            valid = loop.run_until_complete(execution.validate_prompt(prompt_id, prompt, None))
         
         if valid[0]:
             ttNl(f'{CC.GREY}X: {x_label}, Y: {y_label} Z: {z_label}').t(f'Plot Values {self.num}/{self.total} ->').p()
